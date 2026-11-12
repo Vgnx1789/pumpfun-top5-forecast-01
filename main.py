@@ -10,14 +10,14 @@ a shrunk momentum term and a staleness decay; then simulate the ranking
 many times (fixed-seed RNG, so the run is byte-for-byte deterministic),
 injecting synthetic post-cut newcomers so part of every place's mass
 honestly stays unnamed. Place probabilities are the simulation
-frequencies; each place's size distribution is the simulated histogram
-of that place's cap, lightly smoothed onto the task's bin grid.
+frequencies; each place's size distribution (v3) is a discretised
+normal on the task's bin grid, centred on the simulation's median cap
+for that place with the house baseline's fixed sigma of 0.35.
 Standard library only, no network.
 """
 import json
 import math
 import os
-from bisect import bisect_right
 from pathlib import Path
 
 # --- knobs (round numbers; tuned on walk-forward rehearsals) ---
@@ -34,7 +34,7 @@ DRIFT_TAU_H = 3.0     # momentum extrapolation saturates: H*tau/(H+tau)
 TRIALS = 3000
 MAX_CANDIDATES = 250
 MIN_NAMED_P = 0.004
-SIZE_NAMED_MASS = 0.99
+SIZE_SIGMA = 0.35       # v3: the house baseline's size sigma, fixed (see NOTES)
 
 MASK64 = (1 << 64) - 1
 
@@ -92,6 +92,16 @@ def size_of(lamports):
 
 def floor6(x):
     return math.floor(x * 1_000_000) / 1_000_000
+
+
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def median(vals):
+    s = sorted(vals)
+    n = len(s)
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
 def build(input_dir):
@@ -196,23 +206,35 @@ def build(input_dir):
     probabilities.sort(key=lambda r: (r['place'], -r['p'], r['mint']))
     top5 = [m for m, _ in sorted(exp_score.items(), key=lambda kv: (-kv[1], kv[0]))[:places]]
 
-    nbins = len(edges) + 1
+    # --- sizes (v3): a discretised normal per place over the task's bin
+    # grid, centred on the simulation's median cap for that place (so the
+    # momentum/newcomer edge stays in the centre), with sigma in
+    # log10(cap SOL) set by the horizon law below. Its base is the house
+    # baseline's 0.35: the official practice grade is the stronger
+    # evidence for sizes, and there the baseline's tight 0.35 law scored
+    # -19.0 against this model's old simulated-histogram sizes at -38.0
+    # (see work/NOTES.md). Each bin is floored to 6 decimals exactly like
+    # the baseline; what the flooring leaves over is the unnamed share of
+    # the bins not named.
+    # Sigma law: sigma(H) = clamp(0.35 * sqrt(max(H, 1)), 0.35, 1.00)
+    # with H = h_mean, the horizon in hours from the last input mark
+    # (history_until) to the middle of the answer window. At H <= 1 h —
+    # the practice regime, the only one with official evidence — this is
+    # exactly the baseline's fixed 0.35; on the final, whose answers land
+    # 7-13 h after the last mark, it widens honestly for memecoin
+    # dispersion. The centre (the simulation median) is unchanged.
+    sigma_size = min(1.00, max(SIZE_SIGMA,
+                               SIZE_SIGMA * math.sqrt(max(h_mean, 1.0))))
     sizes = []
     for k in range(places):
-        hist = [0.0] * nbins
-        for v in place_sizes[k]:
-            hist[bisect_right(edges, v)] += 1.0
-        tot = sum(hist) or 1.0
-        smooth = []
-        for b in range(nbins):
-            c = hist[b]
-            lft = hist[b - 1] if b > 0 else 0.0
-            rgt = hist[b + 1] if b < nbins - 1 else 0.0
-            smooth.append((0.7 * c + 0.15 * lft + 0.15 * rgt) / tot)
-        sm = sum(smooth) or 1.0
-        for b in range(nbins):
-            fp = floor6(smooth[b] / sm * SIZE_NAMED_MASS)
-            if fp >= 0.0005:
+        centre = median(place_sizes[k])
+        for b in range(len(edges) + 1):
+            lo = -math.inf if b == 0 else edges[b - 1]
+            hi = math.inf if b == len(edges) else edges[b]
+            p_hi = 1.0 if hi == math.inf else norm_cdf((hi - centre) / sigma_size)
+            p_lo = 0.0 if lo == -math.inf else norm_cdf((lo - centre) / sigma_size)
+            fp = floor6(p_hi - p_lo)
+            if fp > 0:
                 sizes.append({"place": k + 1, "bin": b, "p": fp})
     sizes.sort(key=lambda r: (r['place'], r['bin']))
     return {"probabilities": probabilities, "top5": top5, "sizes": sizes}
